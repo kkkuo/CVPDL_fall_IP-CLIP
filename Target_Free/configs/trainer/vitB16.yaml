@@ -1,8 +1,8 @@
 DATALOADER:
   TRAIN_X:
-    BATCH_SIZE: 8
+    BATCH_SIZE: 4 #8
   TRAIN_U:
-    BATCH_SIZE: 8
+    BATCH_SIZE: 4 #8
   TEST:
     BATCH_SIZE: 16
   NUM_WORKERS: 4
@@ -32,4 +32,4 @@ MODEL:
 
 TRAINER:
   IPCLIPB16:
-    PREC: "amp"
+    PREC: "fp16"
