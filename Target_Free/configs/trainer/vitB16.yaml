@@ -32,4 +32,4 @@ MODEL:
 
 TRAINER:
   IPCLIPB16:
-    PREC: "fp16"
+    PREC: "amp"
