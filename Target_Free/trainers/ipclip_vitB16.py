@@ -341,7 +341,7 @@ class CustomCLIP(nn.Module):
     @torch.no_grad()
     def bank_encode(self, image):
         # 用 ResNet101 取 bank 特徵，投影到 512 並 L2 normalize
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.cuda.amp.autocast(enabled=True):
             x = self._preprocess_for_resnet(image)
             feat2048 = self.bank_encoder(x)           # (N, 2048)
             feat512 = self.bank_proj(feat2048)        # (N, 512)
