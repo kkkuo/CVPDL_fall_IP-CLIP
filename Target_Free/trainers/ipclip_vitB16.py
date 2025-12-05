@@ -543,6 +543,13 @@ class IPCLIPB16(TrainerXU):
         self.scaler = GradScaler() if cfg.TRAINER.IPCLIPB16.PREC == "amp" else None  # 自动混合精度训练（Automatic Mixed Precision, AMP）
         self.construct_bank()
 
+        # add, for OOM
+        if hasattr(self.model, "bank_encoder"):
+            self.model.bank_encoder.to("cpu")
+        if hasattr(self.model, "bank_proj"):
+            self.model.bank_proj.to("cpu")
+        torch.cuda.empty_cache()
+
         device_count = torch.cuda.device_count()
         if device_count > 1:
             print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
