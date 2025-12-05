@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
+import torchvision.models as tvm #new
 
 from dassl.engine import TRAINER_REGISTRY, TrainerXU
 from dassl.metrics import compute_accuracy
@@ -302,6 +303,51 @@ class CustomCLIP(nn.Module):
         self.source_feat_bank = nn.Parameter(source_feat_bank)
         self.target_feat_bank = nn.Parameter(target_feat_bank)
 
+        # add
+        self._init_bank_encoder(cfg)
+        clip_mean = torch.tensor(cfg.INPUT.PIXEL_MEAN, dtype=torch.float32).view(1,3,1,1)
+        clip_std  = torch.tensor(cfg.INPUT.PIXEL_STD, dtype=torch.float32).view(1,3,1,1)
+        imnet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1,3,1,1)
+        imnet_std  = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1,3,1,1)
+        self.register_buffer("clip_mean", clip_mean)
+        self.register_buffer("clip_std", clip_std)
+        self.register_buffer("imnet_mean", imnet_mean)
+        self.register_buffer("imnet_std", imnet_std)
+
+    # add
+    def _init_bank_encoder(self, cfg):
+        try:
+            self.bank_encoder = tvm.resnet101(weights=tvm.ResNet101_Weights.IMAGENET1K_V2)
+        except Exception:
+            self.bank_encoder = tvm.resnet101(pretrained=True)
+        self.bank_encoder.fc = nn.Identity()  # 輸出 (N, 2048)
+        for p in self.bank_encoder.parameters():
+            p.requires_grad = False
+        self.bank_proj = nn.Linear(2048, self.dim, bias=False)  # 2048 -> 512
+        for p in self.bank_proj.parameters():
+            p.requires_grad = False
+        self.bank_encoder.eval()
+
+    #add
+    def _preprocess_for_resnet(self, x):
+        # 先把 CLIP normalize 還原，再套 ImageNet normalize
+        x = x.float()
+        x = x * self.clip_std + self.clip_mean
+        x = torch.clamp(x, 0.0, 1.0)
+        x = (x - self.imnet_mean) / self.imnet_std
+        return x
+
+    #add
+    @torch.no_grad()
+    def bank_encode(self, image):
+        # 用 ResNet101 取 bank 特徵，投影到 512 並 L2 normalize
+        with torch.cuda.amp.autocast(enabled=False):
+            x = self._preprocess_for_resnet(image)
+            feat2048 = self.bank_encoder(x)           # (N, 2048)
+            feat512 = self.bank_proj(feat2048)        # (N, 512)
+            feat512 = F.normalize(feat512, dim=-1)
+            return feat512
+    
     @autocast()
     def forward(self, s_image, t_image=None, label=None, domain=None):
         if t_image == None:
@@ -326,7 +372,9 @@ class CustomCLIP(nn.Module):
             if label == None:
                 return logits
             else:
-                logits, feature = logits.detach(), image_features.detach()
+                #logits, feature = logits.detach(), image_features.detach()
+                logits = logits.detach() #add
+                feature = self.bank_encode(image).detach()  # 用 ResNet101 特徵 #add
                 pseudo_label = torch.softmax(logits, dim=-1)
                 max_probs, label_p = torch.max(pseudo_label, dim=-1)
                 if domain == 'source':
