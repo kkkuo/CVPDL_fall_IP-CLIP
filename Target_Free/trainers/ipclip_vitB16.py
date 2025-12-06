@@ -11,7 +11,6 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
-import torchvision.models as tvm #new
 
 from dassl.engine import TRAINER_REGISTRY, TrainerXU
 from dassl.metrics import compute_accuracy
@@ -303,51 +302,12 @@ class CustomCLIP(nn.Module):
         self.source_feat_bank = nn.Parameter(source_feat_bank)
         self.target_feat_bank = nn.Parameter(target_feat_bank)
 
-        # add
-        self._init_bank_encoder(cfg)
-        clip_mean = torch.tensor(cfg.INPUT.PIXEL_MEAN, dtype=torch.float32).view(1,3,1,1)
-        clip_std  = torch.tensor(cfg.INPUT.PIXEL_STD, dtype=torch.float32).view(1,3,1,1)
-        imnet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1,3,1,1)
-        imnet_std  = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1,3,1,1)
-        self.register_buffer("clip_mean", clip_mean)
-        self.register_buffer("clip_std", clip_std)
-        self.register_buffer("imnet_mean", imnet_mean)
-        self.register_buffer("imnet_std", imnet_std)
+        #add
+        global_feat_bank = torch.zeros((self.n_cls * self.K, self.dim))
+        self.global_feat_bank = nn.Parameter(global_feat_bank, requires_grad=False)
+        self.global_max_probs_list = [0.0 for _ in range(self.n_cls * self.K)]
+        self.global_key_dict = {i: i for i in range(self.n_cls * self.K)}
 
-    # add
-    def _init_bank_encoder(self, cfg):
-        try:
-            self.bank_encoder = tvm.resnet101(weights=tvm.ResNet101_Weights.IMAGENET1K_V2)
-        except Exception:
-            self.bank_encoder = tvm.resnet101(pretrained=True)
-        self.bank_encoder.fc = nn.Identity()  # 輸出 (N, 2048)
-        for p in self.bank_encoder.parameters():
-            p.requires_grad = False
-        self.bank_proj = nn.Linear(2048, self.dim, bias=False)  # 2048 -> 512
-        for p in self.bank_proj.parameters():
-            p.requires_grad = False
-        self.bank_encoder.eval()
-
-    #add
-    def _preprocess_for_resnet(self, x):
-        # 先把 CLIP normalize 還原，再套 ImageNet normalize
-        x = x.float()
-        x = x * self.clip_std + self.clip_mean
-        x = torch.clamp(x, 0.0, 1.0)
-        x = (x - self.imnet_mean) / self.imnet_std
-        return x
-
-    #add
-    @torch.no_grad()
-    def bank_encode(self, image):
-        # 用 ResNet101 取 bank 特徵，投影到 512 並 L2 normalize
-        with torch.cuda.amp.autocast(enabled=True):
-            x = self._preprocess_for_resnet(image)
-            feat2048 = self.bank_encoder(x)           # (N, 2048)
-            feat512 = self.bank_proj(feat2048)        # (N, 512)
-            feat512 = F.normalize(feat512, dim=-1)
-            return feat512
-    
     @autocast()
     def forward(self, s_image, t_image=None, label=None, domain=None):
         if t_image == None:
@@ -372,9 +332,7 @@ class CustomCLIP(nn.Module):
             if label == None:
                 return logits
             else:
-                #logits, feature = logits.detach(), image_features.detach()
-                logits = logits.detach() #add
-                feature = self.bank_encode(image).detach()  # 用 ResNet101 特徵 #add
+                logits, feature = logits.detach(), image_features.detach()
                 pseudo_label = torch.softmax(logits, dim=-1)
                 max_probs, label_p = torch.max(pseudo_label, dim=-1)
                 if domain == 'source':
@@ -543,13 +501,6 @@ class IPCLIPB16(TrainerXU):
         self.scaler = GradScaler() if cfg.TRAINER.IPCLIPB16.PREC == "amp" else None  # 自动混合精度训练（Automatic Mixed Precision, AMP）
         self.construct_bank()
 
-        # add, for OOM
-        if hasattr(self.model, "bank_encoder"):
-            self.model.bank_encoder.to("cpu")
-        if hasattr(self.model, "bank_proj"):
-            self.model.bank_proj.to("cpu")
-        torch.cuda.empty_cache()
-
         device_count = torch.cuda.device_count()
         if device_count > 1:
             print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
@@ -566,14 +517,111 @@ class IPCLIPB16(TrainerXU):
             if min(self.model.source_max_probs_list) > 0.99:
                 break
 
-        print("Constructing target feature bank...")
-        data_loader_u = self.train_loader_u
-        for batch_idx, batch in enumerate(data_loader_u):
-            input, label = self.parse_batch_test(batch)
-            self.model(input, label=label, domain='target')
-            if min(self.model.target_max_probs_list) > 0.99:
-                break
+        # print("Constructing target feature bank...")
+        # data_loader_u = self.train_loader_u
+        # for batch_idx, batch in enumerate(data_loader_u):
+        #     input, label = self.parse_batch_test(batch)
+        #     self.model(input, label=label, domain='target')
+        #     if min(self.model.target_max_probs_list) > 0.99:
+        #         break
 
+        # ===== 新增：以四個資料集建立 global feature bank =====
+        # 邏輯：
+        # 1) 對每個資料集（域）各自挑每類 top-K（以 CLIP logits 的 confidence 篩選），取平均得到「域內類別原型」
+        # 2) 將四個域的類別原型相加，得到全域類別原型（每類一個向量）
+        # 3) 為了和 target_feat_bank 形狀一致 (n_cls*K, dim)，把每類的全域原型複製 K 份填滿
+        print("Constructing global feature bank from all 4 domains...")
+
+        @torch.no_grad()
+        def domain_topk_proto(loader):
+            # 以本 domain 之資料，對每個類別保留 K 個最高置信度的特徵，最後做平均
+            n_cls, K, dim = self.model.n_cls, self.model.K, self.model.dim
+            top_probs = torch.zeros(n_cls, K, device=self.device)
+            top_feats = torch.zeros(n_cls, K, dim, device=self.device)
+
+            for _, batch in enumerate(loader):
+                inp, _ = self.parse_batch_test(batch)  # 已在正確 device
+                # 單次前向：取得視覺特徵與 logits（複製 single-path 的邏輯，避免重算）
+                image_features, data = self.model.image_encoder(inp.type(self.model.dtype))
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+                prompts, _ = self.model.prompt_learner(data)
+                tokenized_prompts = self.model.tokenized_prompts
+
+                text_features = []
+                for pts_i in prompts:
+                    tf = self.model.text_encoder(pts_i, tokenized_prompts)
+                    text_features.append(tf)
+                text_features = torch.stack(text_features)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+                logit_scale = self.model.logit_scale.exp()
+                logits = []
+                for txt, im in zip(text_features, image_features):
+                    logits.append(logit_scale * im @ txt.t())
+                logits = torch.stack(logits)  # (B, n_cls)
+
+                probs = torch.softmax(logits, dim=-1)
+                max_probs, label_p = torch.max(probs, dim=-1)  # (B,), (B,)
+
+                # 更新每類的 K 槽（以最小置信度槽位被新樣本取代）
+                for i, c in enumerate(label_p):
+                    cls = int(c.item())
+                    # 找出該類目前 K 槽中最小的置信度
+                    cls_probs = top_probs[cls]              # (K,)
+                    min_val, min_idx = torch.min(cls_probs, dim=0)
+                    if max_probs[i] > min_val:
+                        top_probs[cls, min_idx] = max_probs[i]
+                        top_feats[cls, min_idx] = image_features[i]
+
+            # 對每個類別把非零（被填入）槽做平均；若全為零則保持為零
+            # 以 probs>0 當作選取 mask
+            mask = top_probs > 0
+            # 避免除以 0，先算每類有效槽數
+            counts = mask.sum(dim=1).clamp(min=1).unsqueeze(-1)  # (n_cls, 1)
+            # 將未被選中的槽特徵置零後平均
+            masked_feats = top_feats * mask.unsqueeze(-1)        # (n_cls, K, dim)
+            proto = masked_feats.sum(dim=1) / counts             # (n_cls, dim)
+            # 正規化（可選，通常有助穩定）
+            proto = F.normalize(proto, dim=-1)
+            return proto  # (n_cls, dim)
+
+        # 用四個測試 loader 代表四個域
+        d1 = domain_topk_proto(self.test_loader_1)
+        d2 = domain_topk_proto(self.test_loader_2)
+        d3 = domain_topk_proto(self.test_loader_3)
+        d4 = domain_topk_proto(self.test_loader_4)
+
+        # 四域相加得到全域類別原型，並再 L2 normalize
+        global_proto = F.normalize(d1 + d2 + d3 + d4, dim=-1)    # (n_cls, dim)
+
+        # 寫入 global_feat_bank：每類複製 K 份，形狀對齊 (n_cls*K, dim)
+        with torch.no_grad():
+            n_cls, K = self.model.n_cls, self.model.K
+            for cls in range(n_cls):
+                start = cls * K
+                self.model.global_feat_bank[start:start + K] = global_proto[cls].unsqueeze(0).repeat(K, 1)
+
+        # ===== 目標銀行 = 全域原型 − 來源原型（再正規化），並複製 K 份填滿 =====
+        with torch.no_grad():
+            n_cls, K, d = self.model.n_cls, self.model.K, self.model.dim
+            # 來源類別原型：每類對 K 槽取均值並正規化
+            src_bank = self.model.source_feat_bank.reshape(n_cls, K, d)
+            src_proto = F.normalize(src_bank.mean(dim=1), dim=-1)        # (n_cls, d)
+            # 殘差：global - source
+            tgt_proto = global_proto - src_proto                          # (n_cls, d)
+            # 對殘差做 L2 normalize；若幾乎為 0 向量，退回 global_proto
+            eps = 1e-6
+            norms = tgt_proto.norm(dim=1, keepdim=True)                   # (n_cls, 1)
+            safe = norms.squeeze(1) > eps
+            if safe.any():
+                tgt_proto[safe] = F.normalize(tgt_proto[safe], dim=-1)
+            if (~safe).any():
+                tgt_proto[~safe] = global_proto[~safe]
+            # 寫入 target_feat_bank：每類複製 K 份到 (n_cls*K, d)
+            for cls in range(n_cls):
+                start = cls * K
+                self.model.target_feat_bank[start:start + K] = tgt_proto[cls].unsqueeze(0).repeat(K, 1)
         print('Feature banks are completed!')
 
     def save_model(self, epoch, directory, is_best=False, model_name=""):
@@ -892,4 +940,3 @@ class IPCLIPB16(TrainerXU):
             self.write_scalar(tag, v, self.epoch)
 
         return list(results_test_x.values())[0], list(results_test_1.values())[0], list(results_test_2.values())[0], list(results_test_3.values())[0], list(results_test_4.values())[0]
-
