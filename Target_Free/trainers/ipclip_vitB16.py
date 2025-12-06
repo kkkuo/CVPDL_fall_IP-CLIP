@@ -555,7 +555,11 @@ class IPCLIPB16(TrainerXU):
                 text_features = torch.stack(text_features)
                 text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-                logit_scale = self.model.logit_scale.exp()
+                dtype = self.model.dtype
+                image_features = image_features.type(dtype)
+                text_features = text_features.type(dtype)
+                logit_scale = self.model.logit_scale.exp().type(dtype)
+
                 logits = []
                 for txt, im in zip(text_features, image_features):
                     logits.append(logit_scale * im @ txt.t())
